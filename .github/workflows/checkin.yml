@@ -1,7 +1,9 @@
 name: AnyRouter 自动签到
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # 00:00 UTC = 08:00 Asia/Shanghai. Scheduled runs add a random
+    # delay below so the daily check-in does not always happen at one minute.
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       debug:
@@ -19,6 +21,14 @@ jobs:
       PYTHONUNBUFFERED: 1
       DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' && 'true' || 'false' }}
     steps:
+    - name: 随机等待（仅定时任务）
+      if: github.event_name == 'schedule'
+      shell: bash
+      run: |
+        delay_seconds=$(shuf -i 300-3600 -n 1)
+        echo "Scheduled check-in will start after ${delay_seconds} seconds."
+        sleep "${delay_seconds}"
+
     - uses: actions/checkout@v6
 
     - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
@@ -142,3 +152,4 @@ jobs:
           echo "调试截图已上传为 artifact: checkin-screenshots-${{ github.run_id }}"
           ls -la checkin_screenshots/
         fi
+
