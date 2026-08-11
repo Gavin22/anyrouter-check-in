@@ -234,6 +234,60 @@ async def login_with_credentials(
 		return None
 
 
+async def login_with_api_credentials(
+	account_name: str,
+	provider_config,
+	email: str,
+	password: str,
+) -> BrowserLoginResult | None:
+	"""使用 NewAPI 登录接口创建全新会话，避免依赖云端浏览器渲染登录页。"""
+	if not provider_config.login_api_path:
+		return None
+
+	print(f'[PROCESSING] {account_name}: Logging in through provider API...')
+	client_kwargs: dict = {'http2': True, 'timeout': 30.0}
+	proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
+	if proxy_url:
+		client_kwargs['proxy'] = proxy_url
+
+	headers = {
+		'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+		'Accept': 'application/json, text/plain, */*',
+		'Content-Type': 'application/json',
+		'Origin': provider_config.domain,
+		'Referer': f'{provider_config.domain}{provider_config.login_path}',
+	}
+	login_url = f'{provider_config.domain}{provider_config.login_api_path}'
+
+	try:
+		async with httpx.AsyncClient(**client_kwargs) as client:
+			response = await client.post(
+				login_url,
+				headers=headers,
+				json={'username': email, 'password': password},
+			)
+			if response.status_code != 200:
+				print(f'[FAILED] {account_name}: API login failed - HTTP {response.status_code}')
+				return None
+
+			payload = response.json()
+			user_data = payload.get('data') if isinstance(payload, dict) else None
+			if payload.get('success') is not True or not isinstance(user_data, dict) or not user_data.get('id'):
+				print(f'[FAILED] {account_name}: API login was not accepted')
+				return None
+
+			cookies = dict(client.cookies)
+			if not cookies.get('session'):
+				print(f'[FAILED] {account_name}: API login returned no session cookie')
+				return None
+
+			print(f'[SUCCESS] {account_name}: API login successful, got {len(cookies)} cookies')
+			return BrowserLoginResult(cookies=cookies, api_user=str(user_data['id']))
+	except Exception as e:
+		print(f'[FAILED] {account_name}: API login error - {str(e)[:80]}')
+		return None
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -369,13 +423,21 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	if account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
-		login_result = await login_with_credentials(
-			account_name,
-			provider_config,
-			account.provider,
-			account.email,
-			account.password,
-		)
+		if provider_config.login_api_path:
+			login_result = await login_with_api_credentials(
+				account_name,
+				provider_config,
+				account.email,
+				account.password,
+			)
+		else:
+			login_result = await login_with_credentials(
+				account_name,
+				provider_config,
+				account.provider,
+				account.email,
+				account.password,
+			)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
@@ -635,7 +697,7 @@ async def main():
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	sys.exit(0 if success_count > 0 else 1)
+	sys.exit(0 if success_count == total_count else 1)
 
 
 def run_main():
@@ -652,3 +714,4 @@ def run_main():
 
 if __name__ == '__main__':
 	run_main()
+
