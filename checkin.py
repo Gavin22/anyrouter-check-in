@@ -117,7 +117,11 @@ async def get_waf_cookies_with_browser(
 		for cookie in cookies:
 			cookie_name = cookie.get('name')
 			cookie_value = cookie.get('value')
-			if cookie_name in required_cookies and cookie_value is not None:
+			if (
+				cookie_name
+				and cookie_value is not None
+				and (cookie_name in required_cookies or cookie_name.startswith(('acw_', 'cdn_sec_')))
+			):
 				waf_cookies[cookie_name] = cookie_value
 
 		print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
@@ -245,6 +249,18 @@ async def login_with_api_credentials(
 		return None
 
 	print(f'[PROCESSING] {account_name}: Logging in through provider API...')
+	waf_cookies = {}
+	if provider_config.needs_waf_cookies():
+		waf_cookies = await get_waf_cookies_with_browser(
+			account_name,
+			f'{provider_config.domain}{provider_config.login_path}',
+			provider_config.waf_cookie_names,
+			use_proxy=provider_config.use_proxy,
+		)
+		if not waf_cookies:
+			print(f'[FAILED] {account_name}: Unable to prepare WAF cookies for API login')
+			return None
+
 	client_kwargs: dict = {'http2': True, 'timeout': 30.0}
 	proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
 	if proxy_url:
@@ -261,6 +277,7 @@ async def login_with_api_credentials(
 
 	try:
 		async with httpx.AsyncClient(**client_kwargs) as client:
+			client.cookies.update(waf_cookies)
 			response = await client.post(
 				login_url,
 				headers=headers,
@@ -270,9 +287,20 @@ async def login_with_api_credentials(
 				print(f'[FAILED] {account_name}: API login failed - HTTP {response.status_code}')
 				return None
 
-			payload = response.json()
+			try:
+				payload = response.json()
+			except json.JSONDecodeError:
+				content_type = response.headers.get('content-type', 'unknown').split(';', 1)[0]
+				print(f'[FAILED] {account_name}: API login returned non-JSON content ({content_type})')
+				return None
+
 			user_data = payload.get('data') if isinstance(payload, dict) else None
-			if payload.get('success') is not True or not isinstance(user_data, dict) or not user_data.get('id'):
+			if (
+				not isinstance(payload, dict)
+				or payload.get('success') is not True
+				or not isinstance(user_data, dict)
+				or not user_data.get('id')
+			):
 				print(f'[FAILED] {account_name}: API login was not accepted')
 				return None
 
@@ -714,4 +742,3 @@ def run_main():
 
 if __name__ == '__main__':
 	run_main()
-
