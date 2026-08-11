@@ -234,168 +234,6 @@ async def login_with_credentials(
 		return None
 
 
-async def login_with_browser_api_credentials(
-	account_name: str,
-	provider_config,
-	email: str,
-	password: str,
-) -> BrowserLoginResult | None:
-	"""在真实浏览器会话中调用登录接口，保留 WAF 请求特征。"""
-	login_url = f'{provider_config.domain}{provider_config.login_api_path}'
-	user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-	launch_kwargs: dict = {'headless': True}
-	proxy = get_playwright_proxy(use_proxy=provider_config.use_proxy)
-	if proxy:
-		launch_kwargs['proxy'] = proxy
-
-	browser = None
-	try:
-		browser = await launch_async(**launch_kwargs)
-		page = await browser.new_page()
-		await prepare_browser_page(page)
-		await page.goto(f'{provider_config.domain}{provider_config.login_path}', wait_until='domcontentloaded')
-		await wait_for_waf_ready(page)
-
-		result = await page.evaluate(
-			"""async ({ loginUrl, userInfoUrl, apiUserKey, email, password }) => {
-				const parseJson = async (response) => {
-					try { return await response.json(); } catch { return null; }
-				};
-				const loginResponse = await fetch(loginUrl, {
-					method: 'POST',
-					credentials: 'include',
-					headers: { 'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json' },
-					body: JSON.stringify({ username: email, password }),
-				});
-				const loginPayload = await parseJson(loginResponse);
-				const userId = loginPayload?.success === true ? loginPayload?.data?.id : null;
-				if (!userId) {
-					return {
-						loginStatus: loginResponse.status,
-						loginContentType: loginResponse.headers.get('content-type') || 'unknown',
-						loginSuccess: false,
-					};
-				}
-				const userResponse = await fetch(userInfoUrl, {
-					credentials: 'include',
-					headers: { 'Accept': 'application/json, text/plain, */*', [apiUserKey]: String(userId) },
-				});
-				const userPayload = await parseJson(userResponse);
-				return {
-					loginStatus: loginResponse.status,
-					loginSuccess: true,
-					userId: String(userId),
-					userStatus: userResponse.status,
-					userData: userPayload?.success === true ? userPayload?.data : null,
-				};
-			} """,
-			{
-				'loginUrl': login_url,
-				'userInfoUrl': user_info_url,
-				'apiUserKey': provider_config.api_user_key,
-				'email': email,
-				'password': password,
-			},
-		)
-
-		if not isinstance(result, dict) or result.get('loginSuccess') is not True:
-			status = result.get('loginStatus', 'unknown') if isinstance(result, dict) else 'unknown'
-			content_type = result.get('loginContentType', 'unknown') if isinstance(result, dict) else 'unknown'
-			print(f'[FAILED] {account_name}: Browser API login failed - HTTP {status} ({content_type})')
-			return None
-
-		user_data = result.get('userData')
-		if result.get('userStatus') != 200 or not isinstance(user_data, dict):
-			print(f'[FAILED] {account_name}: Browser API login was not verified by user info')
-			return None
-
-		cookies = {
-			cookie.get('name'): cookie.get('value')
-			for cookie in await page.context.cookies()
-			if cookie.get('name') and cookie.get('value')
-		}
-		if not cookies.get('session'):
-			print(f'[FAILED] {account_name}: Browser API login returned no session cookie')
-			return None
-
-		print(f'[SUCCESS] {account_name}: Browser API login and user verification successful')
-		return BrowserLoginResult(cookies=cookies, api_user=result['userId'], user_info=user_data)
-	except Exception as e:
-		print(f'[FAILED] {account_name}: Browser API login error - {str(e)[:80]}')
-		return None
-	finally:
-		if browser is not None:
-			await browser.close()
-
-
-async def login_with_api_credentials(
-	account_name: str,
-	provider_config,
-	email: str,
-	password: str,
-) -> BrowserLoginResult | None:
-	"""使用 NewAPI 登录接口创建全新会话，避免依赖云端浏览器渲染登录页。"""
-	if not provider_config.login_api_path:
-		return None
-
-	print(f'[PROCESSING] {account_name}: Logging in through provider API...')
-	if provider_config.needs_waf_cookies():
-		return await login_with_browser_api_credentials(account_name, provider_config, email, password)
-
-	client_kwargs: dict = {'http2': True, 'timeout': 30.0}
-	proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
-	if proxy_url:
-		client_kwargs['proxy'] = proxy_url
-
-	headers = {
-		'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-		'Accept': 'application/json, text/plain, */*',
-		'Content-Type': 'application/json',
-		'Origin': provider_config.domain,
-		'Referer': f'{provider_config.domain}{provider_config.login_path}',
-	}
-	login_url = f'{provider_config.domain}{provider_config.login_api_path}'
-
-	try:
-		async with httpx.AsyncClient(**client_kwargs) as client:
-			response = await client.post(
-				login_url,
-				headers=headers,
-				json={'username': email, 'password': password},
-			)
-			if response.status_code != 200:
-				print(f'[FAILED] {account_name}: API login failed - HTTP {response.status_code}')
-				return None
-
-			try:
-				payload = response.json()
-			except json.JSONDecodeError:
-				content_type = response.headers.get('content-type', 'unknown').split(';', 1)[0]
-				print(f'[FAILED] {account_name}: API login returned non-JSON content ({content_type})')
-				return None
-
-			user_data = payload.get('data') if isinstance(payload, dict) else None
-			if (
-				not isinstance(payload, dict)
-				or payload.get('success') is not True
-				or not isinstance(user_data, dict)
-				or not user_data.get('id')
-			):
-				print(f'[FAILED] {account_name}: API login was not accepted')
-				return None
-
-			cookies = dict(client.cookies)
-			if not cookies.get('session'):
-				print(f'[FAILED] {account_name}: API login returned no session cookie')
-				return None
-
-			print(f'[SUCCESS] {account_name}: API login successful, got {len(cookies)} cookies')
-			return BrowserLoginResult(cookies=cookies, api_user=str(user_data['id']))
-	except Exception as e:
-		print(f'[FAILED] {account_name}: API login error - {str(e)[:80]}')
-		return None
-
-
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -527,30 +365,20 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	# 邮箱密码优先
 	all_cookies = None
 	resolved_api_user: str | None = None
-	verified_user_info: dict | None = None
 	auth_method = None
 	if account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
-		if provider_config.login_api_path:
-			login_result = await login_with_api_credentials(
-				account_name,
-				provider_config,
-				account.email,
-				account.password,
-			)
-		else:
-			login_result = await login_with_credentials(
-				account_name,
-				provider_config,
-				account.provider,
-				account.email,
-				account.password,
-			)
+		login_result = await login_with_credentials(
+			account_name,
+			provider_config,
+			account.provider,
+			account.email,
+			account.password,
+		)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
-			verified_user_info = login_result.user_info
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
@@ -567,18 +395,6 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
-	if verified_user_info is not None and not provider_config.needs_manual_check_in():
-		quota = round(verified_user_info.get('quota', 0) / 500000, 2)
-		used_quota = round(verified_user_info.get('used_quota', 0) / 500000, 2)
-		user_info = {
-			'success': True,
-			'quota': quota,
-			'used_quota': used_quota,
-			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-		}
-		print(user_info['display'])
-		print(f'[INFO] {account_name}: Check-in completed automatically (verified in browser)')
-		return True, user_info, user_info
 
 	return run_check_in_requests(
 		all_cookies,
@@ -819,7 +635,7 @@ async def main():
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	sys.exit(0 if success_count == total_count else 1)
+	sys.exit(0 if success_count > 0 else 1)
 
 
 def run_main():
