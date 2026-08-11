@@ -70,7 +70,17 @@ jobs:
 
     - name: 安装 CloakBrowser
       run: |
+        set +e
         uv run python -m cloakbrowser install
+        install_status=$?
+        set -e
+        if [ "${install_status}" -ne 0 ]; then
+          browser_path="$(find "$HOME/.cloakbrowser" -maxdepth 3 -type f -name chrome -print -quit)"
+          if [ "${install_status}" -ne 139 ] || [ -z "${browser_path}" ] || [ ! -x "${browser_path}" ]; then
+            exit "${install_status}"
+          fi
+          echo "::warning::CloakBrowser installer exited 139 after producing an executable browser; continuing."
+        fi
         echo "✅ CloakBrowser 安装完成"
 
     - name: 恢复余额历史缓存
