@@ -117,11 +117,7 @@ async def get_waf_cookies_with_browser(
 		for cookie in cookies:
 			cookie_name = cookie.get('name')
 			cookie_value = cookie.get('value')
-			if (
-				cookie_name
-				and cookie_value is not None
-				and (cookie_name in required_cookies or cookie_name.startswith(('acw_', 'cdn_sec_')))
-			):
+			if cookie_name in required_cookies and cookie_value is not None:
 				waf_cookies[cookie_name] = cookie_value
 
 		print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
@@ -238,6 +234,100 @@ async def login_with_credentials(
 		return None
 
 
+async def login_with_browser_api_credentials(
+	account_name: str,
+	provider_config,
+	email: str,
+	password: str,
+) -> BrowserLoginResult | None:
+	"""在真实浏览器会话中调用登录接口，保留 WAF 请求特征。"""
+	login_url = f'{provider_config.domain}{provider_config.login_api_path}'
+	user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+	launch_kwargs: dict = {'headless': True}
+	proxy = get_playwright_proxy(use_proxy=provider_config.use_proxy)
+	if proxy:
+		launch_kwargs['proxy'] = proxy
+
+	browser = None
+	try:
+		browser = await launch_async(**launch_kwargs)
+		page = await browser.new_page()
+		await prepare_browser_page(page)
+		await page.goto(f'{provider_config.domain}{provider_config.login_path}', wait_until='domcontentloaded')
+		await wait_for_waf_ready(page)
+
+		result = await page.evaluate(
+			"""async ({ loginUrl, userInfoUrl, apiUserKey, email, password }) => {
+				const parseJson = async (response) => {
+					try { return await response.json(); } catch { return null; }
+				};
+				const loginResponse = await fetch(loginUrl, {
+					method: 'POST',
+					credentials: 'include',
+					headers: { 'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json' },
+					body: JSON.stringify({ username: email, password }),
+				});
+				const loginPayload = await parseJson(loginResponse);
+				const userId = loginPayload?.success === true ? loginPayload?.data?.id : null;
+				if (!userId) {
+					return {
+						loginStatus: loginResponse.status,
+						loginContentType: loginResponse.headers.get('content-type') || 'unknown',
+						loginSuccess: false,
+					};
+				}
+				const userResponse = await fetch(userInfoUrl, {
+					credentials: 'include',
+					headers: { 'Accept': 'application/json, text/plain, */*', [apiUserKey]: String(userId) },
+				});
+				const userPayload = await parseJson(userResponse);
+				return {
+					loginStatus: loginResponse.status,
+					loginSuccess: true,
+					userId: String(userId),
+					userStatus: userResponse.status,
+					userData: userPayload?.success === true ? userPayload?.data : null,
+				};
+			} """,
+			{
+				'loginUrl': login_url,
+				'userInfoUrl': user_info_url,
+				'apiUserKey': provider_config.api_user_key,
+				'email': email,
+				'password': password,
+			},
+		)
+
+		if not isinstance(result, dict) or result.get('loginSuccess') is not True:
+			status = result.get('loginStatus', 'unknown') if isinstance(result, dict) else 'unknown'
+			content_type = result.get('loginContentType', 'unknown') if isinstance(result, dict) else 'unknown'
+			print(f'[FAILED] {account_name}: Browser API login failed - HTTP {status} ({content_type})')
+			return None
+
+		user_data = result.get('userData')
+		if result.get('userStatus') != 200 or not isinstance(user_data, dict):
+			print(f'[FAILED] {account_name}: Browser API login was not verified by user info')
+			return None
+
+		cookies = {
+			cookie.get('name'): cookie.get('value')
+			for cookie in await page.context.cookies()
+			if cookie.get('name') and cookie.get('value')
+		}
+		if not cookies.get('session'):
+			print(f'[FAILED] {account_name}: Browser API login returned no session cookie')
+			return None
+
+		print(f'[SUCCESS] {account_name}: Browser API login and user verification successful')
+		return BrowserLoginResult(cookies=cookies, api_user=result['userId'], user_info=user_data)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser API login error - {str(e)[:80]}')
+		return None
+	finally:
+		if browser is not None:
+			await browser.close()
+
+
 async def login_with_api_credentials(
 	account_name: str,
 	provider_config,
@@ -249,17 +339,8 @@ async def login_with_api_credentials(
 		return None
 
 	print(f'[PROCESSING] {account_name}: Logging in through provider API...')
-	waf_cookies = {}
 	if provider_config.needs_waf_cookies():
-		waf_cookies = await get_waf_cookies_with_browser(
-			account_name,
-			f'{provider_config.domain}{provider_config.login_path}',
-			provider_config.waf_cookie_names,
-			use_proxy=provider_config.use_proxy,
-		)
-		if not waf_cookies:
-			print(f'[FAILED] {account_name}: Unable to prepare WAF cookies for API login')
-			return None
+		return await login_with_browser_api_credentials(account_name, provider_config, email, password)
 
 	client_kwargs: dict = {'http2': True, 'timeout': 30.0}
 	proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
@@ -277,7 +358,6 @@ async def login_with_api_credentials(
 
 	try:
 		async with httpx.AsyncClient(**client_kwargs) as client:
-			client.cookies.update(waf_cookies)
 			response = await client.post(
 				login_url,
 				headers=headers,
@@ -447,6 +527,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	# 邮箱密码优先
 	all_cookies = None
 	resolved_api_user: str | None = None
+	verified_user_info: dict | None = None
 	auth_method = None
 	if account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
@@ -469,6 +550,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
+			verified_user_info = login_result.user_info
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
@@ -485,6 +567,18 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
+	if verified_user_info is not None and not provider_config.needs_manual_check_in():
+		quota = round(verified_user_info.get('quota', 0) / 500000, 2)
+		used_quota = round(verified_user_info.get('used_quota', 0) / 500000, 2)
+		user_info = {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+		print(user_info['display'])
+		print(f'[INFO] {account_name}: Check-in completed automatically (verified in browser)')
+		return True, user_info, user_info
 
 	return run_check_in_requests(
 		all_cookies,
