@@ -98,6 +98,14 @@ jobs:
         PROXY_REQUIRED: false
       run: bash scripts/setup_mihomo_proxy.sh
 
+    # 临时诊断步骤：用一次性假凭据探测登录接口，判断 runner 出口是否被站点拦截。
+    # 不涉及真实账号密码。AgentRouter 恢复正常后删除本步骤及对应脚本。
+    - name: 诊断 AgentRouter 登录接口（假凭据）
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        PROBE_DOMAIN: https://agentrouter.org
+      run: bash scripts/probe_agentrouter_login.sh
+
     - name: 执行签到
       env:
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
