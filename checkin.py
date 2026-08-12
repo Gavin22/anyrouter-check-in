@@ -93,18 +93,28 @@ async def get_waf_cookies_with_browser(
 	required_cookies: list[str],
 	*,
 	use_proxy: bool = False,
+	provider_name: str = '',
 ):
 	"""使用浏览器获取 WAF cookies"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
 
-	launch_kwargs: dict = {'headless': True}
+	# 与邮箱密码登录复用同一套启动参数。同一进程内先启动 headless 且未开启
+	# humanize 的浏览器，会让后续 humanize 浏览器的点击无法真正派发到页面，
+	# 表现为 cookie 账号成功、随后的密码登录账号全部卡在登录验证。
+	settings = load_browser_login_settings(account_name, provider_name, persist_profile=False)
+	launch_kwargs: dict = {'headless': settings.headless, 'humanize': settings.humanize}
+	if settings.humanize:
+		launch_kwargs['human_preset'] = 'careful'
 	proxy = get_playwright_proxy(use_proxy=use_proxy)
 	if proxy:
 		launch_kwargs['proxy'] = proxy
+	debug_print(
+		f'[INFO] {account_name}: WAF browser headless={settings.headless}, humanize={settings.humanize}'
+	)
 	browser = await launch_async(**launch_kwargs)
 
 	try:
-		page = await browser.new_page()
+		page = await browser.new_page(viewport={'width': 1920, 'height': 1080})
 		await prepare_browser_page(page)
 		print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
 
@@ -267,6 +277,7 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 			login_url,
 			provider_config.waf_cookie_names,
 			use_proxy=provider_config.use_proxy,
+			provider_name=provider_config.name,
 		)
 		if not waf_cookies:
 			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
