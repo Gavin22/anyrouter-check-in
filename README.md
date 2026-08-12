@@ -13,7 +13,7 @@
 
 **维护开源不易，如果本项目帮助到了你，请帮忙点个 Star，谢谢!**
 
-用于 Claude Code 中转站 Any Router 网站多账号每日签到，一次 $25，限时注册即送 100 美金，[点击这里注册](https://anyrouter.top/register?aff=gSsN)。业界良心，支持 Claude Sonnet 4.5、GPT-5-Codex、Claude Code 百万上下文（使用 `/model sonnet[1m]` 开启），`gemini-2.5-pro` 模型。
+用于 Claude Code 中转站 Any Router 网站多账号每日签到，一次 $25，限时注册即送 100 美金，[点击这里注册](https://anyrouter.top/register?aff=ousu)。业界良心，支持 Claude Sonnet 4.5、GPT-5-Codex、Claude Code 百万上下文（使用 `/model sonnet[1m]` 开启），`gemini-2.5-pro` 模型。
 
 ## 功能特性
 
@@ -429,6 +429,34 @@ uv run bandit -r . -c pyproject.toml
 # 运行测试
 uv run pytest tests/ --cov=.
 ```
+
+## 本 fork 与上游的差异
+
+| 改动 | 位置 | 原因 |
+| --- | --- | --- |
+| 每天 08:00（北京）签到一次，并在定时触发时随机等待 5～60 分钟 | `.github/workflows/checkin.yml` | AnyRouter 需 08:00 之后才发额度；随机延迟避免固定时间点签到 |
+| WAF cookie 浏览器与邮箱密码登录复用同一套启动参数 | `checkin.py` `get_waf_cookies_with_browser()` | 修复下面记录的问题 |
+
+### 问题记录：cookie 账号在前会让后续密码登录账号全部失败
+
+**现象**：`ANYROUTER_ACCOUNTS` 里同时存在 cookie 账号（AnyRouter，LinuxDO 授权只能用 session）和邮箱密码账号（AgentRouter）时，cookie 账号签到成功，后面每个密码登录账号都停在：
+
+```
+[INFO] Navigating login page (attempt 1/3): https://agentrouter.org/login
+[INFO] Verifying login via https://agentrouter.org/console and /api/user/self
+[WARN] Login verification failed: current URL=https://agentrouter.org/login
+[INFO] Got cookies: ['acw_tc']
+```
+
+登录页正常渲染、表单能填、提交按钮也点了（全程不抛异常），但始终拿不到 `session`。
+
+**根因**：同一进程内混用了 CloakBrowser 启动参数。`get_waf_cookies_with_browser()` 原本硬编码 `headless=True` 且不开 `humanize`，而 `launch_login_context()` 是 `headless=False` + `humanize=True` + `human_preset='careful'`。先启动前者会让后者的点击无法真正派发到页面——`fill` 因为有 JS setter 兜底仍然写入成功，所以表现为"提交了但没有请求发出"。
+
+上游没有这个问题，是因为上游示例里第一个账号就走邮箱密码，整个进程的启动参数天然一致。
+
+**排查中被逐一排除的因素**：代理节点与出口 IP（探测显示 runner 直连 `agentrouter.org` 即可达，出口就是 Azure IP）、`PROXY_TEST_URL` 用 Google 测速、账号密码本身、账号名含中文、主域名 DNS 污染。对照实验中这些全部未改动，仅统一启动参数即从 1/3 变为 3/3。
+
+**修复**：`get_waf_cookies_with_browser()` 改为读取与登录路径相同的 `BrowserLoginSettings`，使 `headless` / `humanize` / `viewport` 在整个进程内保持一致。
 
 ## 免责声明
 
