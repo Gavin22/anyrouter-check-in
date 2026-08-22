@@ -278,9 +278,54 @@
 
 ### 获取访问令牌
 
-1. 用 GitHub 授权登录站点
-2. 进入个人资料页，生成/复制「系统访问令牌」（接口为 `GET /api/user/token`）
-3. 注意：**重新生成会让旧令牌立即失效**。该令牌只用于面板接口，和 `/console` 里给模型用的 `sk-` API 密钥是两套东西，互不影响
+对应后端接口是 `GET /api/user/token`（`controller.GenerateAccessToken`）。这两站的令牌页面路由藏得比较深（`/profile`、`/personal` 都会跳回首页或 404），**用浏览器控制台调接口最省事也最可靠**。
+
+> ⚠️ 重新生成会让**旧令牌立即失效**，别反复执行。该令牌只用于面板接口，和 `/console` 里给模型调用的 `sk-` 开头的 API 密钥是两套东西，互不影响。
+
+#### gorouter.app
+
+1. 浏览器打开 https://gorouter.app ，确认已用 GitHub 授权登录
+2. 按 `F12` 打开开发者工具，切到 **Console**
+3. 粘贴执行：
+
+```js
+fetch('/api/user/token', { headers: { 'New-Api-User': localStorage.getItem('uid') } })
+  .then(r => r.json())
+  .then(d => console.log('令牌:', d.data, '\n用户ID:', localStorage.getItem('uid')))
+```
+
+4. 令牌和用户 ID **两个都要**，填入 `access_token` 和 `api_user`
+
+gorouter 属于 rc.21，认证靠 `session` cookie + `new-api-user` 请求头；换成访问令牌后仍**必须带 `New-Api-User`**，只带 `Authorization` 会返回 `401 Unauthorized, New-Api-User header not provided`。
+
+#### tabitoken.com
+
+1. 浏览器打开 https://tabitoken.com ，确认已用 GitHub 授权登录
+2. `F12` → **Console**，粘贴执行：
+
+```js
+fetch('/api/user/auth/refresh', { method: 'POST' })
+  .then(r => r.json())
+  .then(b => fetch('/api/user/token', { headers: { Authorization: 'Bearer ' + b.data.access_token } }))
+  .then(r => r.json())
+  .then(d => console.log('令牌:', d.data))
+```
+
+3. 只需要令牌，`api_user` 可省略
+
+多这一步 refresh 是因为 rc.23 已经彻底移除 cookie 会话：浏览器里存的是 `new_api_refresh` cookie（限定 path `/api/user/auth`），要先用它换一个 15 分钟有效的 access token，才能调 `/api/user/token`。所以直接 `fetch('/api/user/token')` 会返回 `access token 无效`。
+
+#### 验证令牌可用
+
+拿到令牌后可以先自测（把 `<域名>` 和 `<令牌>` 换掉；gorouter 记得补 `-H "New-Api-User: <用户ID>"`）：
+
+```bash
+curl -s "https://<域名>/api/user/self" \
+  -H "Authorization: Bearer <令牌>" \
+  -H "User-Agent: Mozilla/5.0" | head -c 300
+```
+
+返回 `"success":true` 且能看到 `quota` 就说明可用。若返回 403 HTML，是出口 IP 被 Cloudflare 拦了，给该 provider 打开 `use_proxy` 即可。
 
 ### 账号配置
 
@@ -288,6 +333,15 @@
 [
   { "name": "GoRouter", "provider": "gorouter", "access_token": "你的访问令牌", "api_user": "你的用户 ID" },
   { "name": "TaBiAI", "provider": "tabitoken", "access_token": "你的访问令牌" }
+]
+```
+
+同一个站点的多个账号，各配一条、`name` 取不同名字即可：
+
+```json
+[
+  { "name": "TaBiAI", "provider": "tabitoken", "access_token": "账号一的令牌" },
+  { "name": "TaBiAI 2", "provider": "tabitoken", "access_token": "账号二的令牌" }
 ]
 ```
 

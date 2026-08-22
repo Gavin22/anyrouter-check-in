@@ -111,9 +111,7 @@ async def get_waf_cookies_with_browser(
 	proxy = get_playwright_proxy(use_proxy=use_proxy)
 	if proxy:
 		launch_kwargs['proxy'] = proxy
-	debug_print(
-		f'[INFO] {account_name}: WAF browser headless={settings.headless}, humanize={settings.humanize}'
-	)
+	debug_print(f'[INFO] {account_name}: WAF browser headless={settings.headless}, humanize={settings.humanize}')
 	browser = await launch_async(**launch_kwargs)
 
 	try:
@@ -502,38 +500,54 @@ def run_bearer_check_in(
 		return False, None, None, None
 
 
-def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息"""
-	lines = [
-		f'[CHECK-IN] {detail["name"]}',
-		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  签到前',
-		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
-		'  签到后',
-		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
-	]
+SEPARATOR = '━━━━━━━━━━━━━━━━━━━━'
 
+
+def format_check_in_notification(detail: dict) -> str:
+	"""格式化单个账号的签到结果"""
 	has_reward = detail['check_in_reward'] != 0
 	has_usage = detail['usage_increase'] != 0
 
-	if has_reward or has_usage:
-		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
-
-		if not has_reward and has_usage:
-			lines.append('  今日已签到（期间有使用）')
-
-		if has_reward:
-			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
-
-		if has_usage:
-			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
-
-		if detail['balance_change'] != 0:
-			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
+	if not detail['success']:
+		icon = '❌'
+	elif has_reward:
+		icon = '🎁'
 	else:
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
+		icon = '✅'
 
+	lines = [SEPARATOR, f'{icon} {detail["name"]}']
+
+	# 余额有变化时用「签到前 → 签到后」，没变化就只显示一个值，避免重复噪音
+	if detail['before_quota'] != detail['after_quota']:
+		lines.append(f'   💰 余额：${detail["before_quota"]:.2f} → ${detail["after_quota"]:.2f}')
+	else:
+		lines.append(f'   💰 余额：${detail["after_quota"]:.2f}')
+
+	if detail['before_used'] != detail['after_used']:
+		lines.append(f'   📊 累计消耗：${detail["before_used"]:.2f} → ${detail["after_used"]:.2f}')
+	else:
+		lines.append(f'   📊 累计消耗：${detail["after_used"]:.2f}')
+
+	if has_reward:
+		lines.append(f'   ✨ 本次签到获得：+${detail["check_in_reward"]:.2f}')
+	if has_usage:
+		lines.append(f'   🔻 期间消耗：${detail["usage_increase"]:.2f}')
+
+	if not has_reward:
+		lines.append('   ⏭️ 今日已签到，余额无变化' if not has_usage else '   ⏭️ 今日已签到（期间有使用）')
+
+	return '\n'.join(lines)
+
+
+def format_failure_notification(account_name: str, user_info: dict | None) -> str:
+	"""格式化单个账号的失败结果"""
+	lines = [SEPARATOR, f'❌ {account_name}']
+	if user_info and user_info.get('success'):
+		lines.append(f'   💰 余额：${user_info["quota"]:.2f}')
+		lines.append(f'   📊 累计消耗：${user_info["used_quota"]:.2f}')
+	elif user_info:
+		lines.append(f'   ⚠️ {user_info.get("error", "未知错误")}')
+	lines.append('   ❗ 签到失败，请查看运行日志')
 	return '\n'.join(lines)
 
 
@@ -712,7 +726,11 @@ async def main():
 	if not accounts:
 		error_msg = '[FAILED] Unable to load account configuration, program exits'
 		print(error_msg)
-		notify.push_message('AnyRouter Check-in Alert', error_msg, msg_type='text')
+		notify.push_message(
+			'每日签到结果',
+			'🚨 账号配置加载失败，脚本已退出\n   请检查 ANYROUTER_ACCOUNTS 是否为合法的单行 JSON',
+			msg_type='text',
+		)
 		sys.exit(1)
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
@@ -721,7 +739,10 @@ async def main():
 
 	success_count = 0
 	total_count = len(accounts)
-	notification_content = []
+	# 按 account_key 存每个账号的通知块，最后按账号顺序拼出来。
+	# 不能用「名字是否已出现在文本里」去重：同站多账号时名字互为前缀
+	# （TaBiAI / TaBiAI 2）会把成功的那个当成重复直接丢掉。
+	account_blocks: dict[str, str] = {}
 	current_balances = {}
 	account_check_in_details = {}
 	need_notify = False
@@ -774,19 +795,17 @@ async def main():
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
-				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
+				# 失败时 user_info_after 往往是空的（例如被 Turnstile 拦下就没走到第二次查询），
+				# 退回用签到前的数据，好让通知里至少有个当前余额
+				account_blocks[account_key] = format_failure_notification(
+					account_name, user_info_after or user_info_before
+				)
 
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			account_blocks[account_key] = f'{SEPARATOR}\n❌ {account_name}\n   ⚠️ 运行异常：{str(e)[:60]}'
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
@@ -802,49 +821,51 @@ async def main():
 			print('[INFO] No balance changes detected')
 
 	if balance_changed:
-		for i, account in enumerate(accounts):
+		for i, _account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
-			if account_key in account_check_in_details:
-				detail = account_check_in_details[account_key]
-				account_name = detail['name']
-				account_result = format_check_in_notification(detail)
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
+			if account_key in account_blocks:
+				continue
+			detail = account_check_in_details.get(account_key)
+			if detail:
+				account_blocks[account_key] = format_check_in_notification(detail)
+
+	notification_content = [
+		account_blocks[f'account_{i + 1}'] for i in range(total_count) if f'account_{i + 1}' in account_blocks
+	]
 
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
 	if need_notify and notification_content:
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
+		failed_count = total_count - success_count
+		summary = [SEPARATOR, '📊 汇总', f'   ✅ 成功：{success_count}/{total_count}']
+		if failed_count:
+			summary.append(f'   ❌ 失败：{failed_count}/{total_count}')
 
 		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
+			summary.append('   🎉 全部账号签到成功')
 		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
+			summary.append('   ⚠️ 部分账号签到失败')
 		else:
-			summary.append('[ERROR] All accounts check-in failed')
+			summary.append('   🚨 全部账号签到失败')
 
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+		header = f'🎯 每日签到结果\n🕐 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+		notify_content = '\n\n'.join([header, '\n\n'.join(notification_content), '\n'.join(summary)])
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
 		if screenshot_paths:
 			github_run_id = os.getenv('GITHUB_RUN_ID', '').strip()
 			github_repo = os.getenv('GITHUB_REPOSITORY', '').strip()
-			screenshot_hint = f'[SCREENSHOT] {len(screenshot_paths)} debug screenshot(s) saved'
+			screenshot_hint = f'📷 已保存 {len(screenshot_paths)} 张调试截图'
 			if github_run_id and github_repo:
 				run_url = f'https://github.com/{github_repo}/actions/runs/{github_run_id}'
-				screenshot_hint += f'. Download artifact `checkin-screenshots-{github_run_id}` from: {run_url}'
+				screenshot_hint += f'，下载 artifact `checkin-screenshots-{github_run_id}`：{run_url}'
 			else:
-				screenshot_hint += ' to `checkin_screenshots/`'
+				screenshot_hint += ' 到 `checkin_screenshots/`'
 			notify_content += f'\n\n{screenshot_hint}'
 
 		print(notify_content)
-		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
+		notify.push_message('每日签到结果', notify_content, msg_type='text')
 		print('[NOTIFY] Notification sent due to failures or balance changes')
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
