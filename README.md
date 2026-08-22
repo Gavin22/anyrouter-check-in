@@ -7,7 +7,7 @@
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![License](https://img.shields.io/github/license/millylee/anyrouter-check-in)](LICENSE)
 
-多平台多账号自动签到，理论上支持所有 NewAPI、OneAPI 平台，目前内置支持 Any Router 与 Agent Router，其它可根据文档进行摸索配置。
+多平台多账号自动签到，理论上支持所有 NewAPI、OneAPI 平台，目前内置支持 Any Router、Agent Router、GoRouter、TaBiAI，其它可根据文档进行摸索配置。
 
 推荐搭配使用[Auo](https://github.com/millylee/auo)，支持任意 Claude Code Token 切换的工具。
 
@@ -21,6 +21,7 @@
 - ✅ 单个/多账号自动签到
 - ✅ 多种机器人通知（可选）
 - ✅ 绕过 WAF 限制
+- ✅ 访问令牌签到 + Cloudflare Turnstile 过验（NewAPI v1.0.0-rc 新版站点）
 
 ## 使用方法
 
@@ -82,7 +83,8 @@
 
 - `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
 - `cookies`：兼容旧版的 session cookies 登录方式
-- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略
+- `access_token`：访问令牌登录，用于 `auth_scheme` 为 `bearer` 的站点（如 `gorouter`、`tabitoken`），详见[访问令牌签到](#访问令牌签到gorouter--tabiai-等-newapi-新版站点)
+- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略，`gorouter` 用访问令牌时必填
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -90,7 +92,7 @@
 
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
-- `anyrouter` 与 `agentrouter` 配置已内置，无需填写
+- `anyrouter`、`agentrouter`、`gorouter`、`tabitoken` 配置已内置，无需填写
 
 如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。
 
@@ -239,6 +241,11 @@
   - `"waf_cookies"`：使用 CloakBrowser 打开浏览器获取 WAF cookies 后再执行签到
   - 不设置或 `null`：直接使用用户 cookies 执行签到（适合无 WAF 保护的网站）
 - `waf_cookie_names` (可选)：绕过 WAF 所需 cookie 的名称列表，`bypass_method` 为 `waf_cookies` 时必须设置
+- `auth_scheme` (可选)：认证方式，默认 `"cookie"`
+  - `"cookie"`：用 session cookie（+ `api_user_key` 请求头）认证，AnyRouter / AgentRouter 走这条
+  - `"bearer"`：用 `Authorization: Bearer <访问令牌>` 认证，NewAPI v1.0.0-rc 起的站点走这条
+- `checkin_status_path` (可选)：签到状态查询路径，设置后会先查当天是否已签到，已签到则直接跳过，不发签到请求也不启动浏览器
+- `turnstile_site_key` (可选)：Cloudflare Turnstile 的公开 site key；留空表示运行时从 `/api/status` 读取，站点轮换 key 也不会失效
 
 **配置示例**（完整）：
 
@@ -254,6 +261,57 @@
   }
 }
 ```
+
+## 访问令牌签到（GoRouter / TaBiAI 等 NewAPI 新版站点）
+
+`gorouter`、`tabitoken` 已内置配置，无需在 `PROVIDERS` 中声明，只要在 `ANYROUTER_ACCOUNTS` 里配好账号即可。
+
+### 为什么这两站不能用 session cookie
+
+它们是 NewAPI `v1.0.0-rc` 系列：
+
+- 签到接口从 `/api/user/sign_in` 换成了 `/api/user/checkin`
+- 签到接口挂了 `middleware.TurnstileCheck()`，服务端从 query 参数 `turnstile` 取 token 去 Cloudflare 校验，**纯 HTTP 请求签不了**
+- 只能通过 GitHub 授权登录，且 `rc.23`（tabitoken）已完全移除 cookie 会话，只认 `Authorization` 头
+
+所以这两站用**访问令牌**认证：令牌长期有效，不像 session cookie 那样每月过期，反而比 AnyRouter 更省心。
+
+### 获取访问令牌
+
+1. 用 GitHub 授权登录站点
+2. 进入个人资料页，生成/复制「系统访问令牌」（接口为 `GET /api/user/token`）
+3. 注意：**重新生成会让旧令牌立即失效**。该令牌只用于面板接口，和 `/console` 里给模型用的 `sk-` API 密钥是两套东西，互不影响
+
+### 账号配置
+
+```json
+[
+  { "name": "GoRouter", "provider": "gorouter", "access_token": "你的访问令牌", "api_user": "你的用户 ID" },
+  { "name": "TaBiAI", "provider": "tabitoken", "access_token": "你的访问令牌" }
+]
+```
+
+- `gorouter`（rc.21）除 `Authorization` 外**仍要求 `New-Api-User` 请求头**，缺失会返回 `401 New-Api-User header not provided`，所以必须配 `api_user`
+- `tabitoken`（rc.23）不需要该头，`api_user` 可省略
+- 建议把这两个账号放在数组**末尾**，让 AnyRouter 的持久化 profile 先跑，避免浏览器启动参数互相影响（见文末问题记录）
+
+### 签到流程
+
+1. `GET /api/user/self` 取签到前余额；令牌失效则直接跳过该账号并提示重新生成
+2. `GET /api/user/checkin?month=YYYY-MM` 查当天状态，**已签到就直接结束**（不发请求、不启动浏览器）
+3. `POST /api/user/checkin`；被 Turnstile 拦下时启动 CloakBrowser 取 token，带 `?turnstile=<token>` 重发
+4. `GET /api/user/self` 取签到后余额，进入统一的通知汇总
+
+### Turnstile 处理要点
+
+`utils/turnstile.py` 只负责取 token，签到请求仍由 httpx 带令牌发出——Turnstile token 只绑定「域名 + 公开 site key」，不绑定登录态。实测（2026-08）：
+
+- 站点首页是 SPA 且自己会加载 `api.js`，在其上二次渲染组件**永远出不来 iframe**，因此用 `page.route` 伪造一个同源空白页
+- 组件渲染的是 managed 交互式挑战（「请验证您是真人」复选框），**不会自动过**，必须点复选框；点组件正中间无效，复选框在左侧约 20px 处
+- 组件 iframe 在 closed shadow root 里，Playwright 的 CSS 选择器穿不进去（`#holder iframe` 匹配不到），只能按坐标点
+- token 单次有效、约 300 秒过期，且**必须与后续签到请求同出口 IP**
+- 机房 IP 更容易被判交互式挑战。若 Actions 上取不到 token，给这两个 provider 打开代理即可，不需要改代码：
+  `PROVIDERS={"gorouter":{"domain":"https://gorouter.app","use_proxy":true},"tabitoken":{"domain":"https://tabitoken.com","use_proxy":true}}`
 
 **内置配置说明**：
 
@@ -350,6 +408,16 @@ PROVIDERS={"agentrouter":{"use_proxy":true}}
 3. API User 是否正确
 4. 网站是否更改了签到接口
 5. 查看 Actions 运行日志获取详细错误信息
+
+访问令牌站点（`gorouter` / `tabitoken`）的常见报错：
+
+| 日志 | 原因与处理 |
+| --- | --- |
+| `Access token rejected, skipping check-in` | 令牌失效或被重新生成过，去个人资料页重新生成并更新 secret |
+| `401 New-Api-User header not provided` | `gorouter` 账号漏配 `api_user`，补上你的用户 ID |
+| `Turnstile required but site key is unavailable` | `/api/status` 没读到 site key。该接口必须带浏览器 UA，否则会被 Cloudflare 403 |
+| `Could not obtain Turnstile token` | 出口 IP 被判交互式挑战且没过。开 `DEBUG_MODE=true` 看 `turnstile-*` 截图，再考虑给该 provider 打开 `use_proxy` |
+| `Turnstile 校验失败，请刷新重试` | token 已被用过、超过 300 秒，或取 token 与发签到走了不同出口 IP |
 
 ## 本地开发环境设置
 

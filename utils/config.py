@@ -23,6 +23,9 @@ class ProviderConfig:
 	waf_cookie_names: List[str] | None = None
 	use_proxy: bool = False
 	persist_profile: bool = False
+	auth_scheme: Literal['cookie', 'bearer'] = 'cookie'
+	checkin_status_path: str | None = None
+	turnstile_site_key: str = ''
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -61,6 +64,9 @@ class ProviderConfig:
 			waf_cookie_names=data.get('waf_cookie_names', defaults.waf_cookie_names if defaults else None),
 			use_proxy=data.get('use_proxy', default_use_proxy),
 			persist_profile=data.get('persist_profile', default_persist_profile),
+			auth_scheme=data.get('auth_scheme', defaults.auth_scheme if defaults else 'cookie'),
+			checkin_status_path=data.get('checkin_status_path', defaults.checkin_status_path if defaults else None),
+			turnstile_site_key=data.get('turnstile_site_key', defaults.turnstile_site_key if defaults else ''),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -70,6 +76,14 @@ class ProviderConfig:
 	def needs_manual_check_in(self) -> bool:
 		"""判断是否需要手动调用签到接口"""
 		return self.sign_in_path is not None
+
+	def uses_bearer_auth(self) -> bool:
+		"""判断是否用 Authorization 头认证
+
+		NewAPI v1.0.0-rc 起移除了 cookie 会话（源码中已无 sessions.Default），
+		只认 Authorization 头里的访问令牌。
+		"""
+		return self.auth_scheme == 'bearer'
 
 
 @dataclass
@@ -104,6 +118,33 @@ class AppConfig:
 				bypass_method='waf_cookies',
 				waf_cookie_names=['acw_tc'],
 				use_proxy=True,
+				persist_profile=False,
+			),
+			# 以下两站为 NewAPI v1.0.0-rc：签到接口是 /api/user/checkin，且只认
+			# Authorization 头（上游已移除 cookie 会话），故 auth_scheme='bearer'。
+			# turnstile_site_key 留空表示运行时从 /api/status 读取，站点轮换 key 也不会失效。
+			'gorouter': ProviderConfig(
+				name='gorouter',
+				domain='https://gorouter.app',
+				login_path='/login',
+				sign_in_path='/api/user/checkin',
+				user_info_path='/api/user/self',
+				checkin_status_path='/api/user/checkin',
+				auth_scheme='bearer',
+				bypass_method=None,
+				use_proxy=False,
+				persist_profile=False,
+			),
+			'tabitoken': ProviderConfig(
+				name='tabitoken',
+				domain='https://tabitoken.com',
+				login_path='/login',
+				sign_in_path='/api/user/checkin',
+				user_info_path='/api/user/self',
+				checkin_status_path='/api/user/checkin',
+				auth_scheme='bearer',
+				bypass_method=None,
+				use_proxy=False,
 				persist_profile=False,
 			),
 		}
@@ -155,6 +196,7 @@ class AccountConfig:
 	name: str | None = None
 	email: str | None = None
 	password: str | None = None
+	access_token: str | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
@@ -169,11 +211,16 @@ class AccountConfig:
 			name=name if name else None,
 			email=data.get('email'),
 			password=data.get('password'),
+			access_token=data.get('access_token'),
 		)
 
 	def has_login_credentials(self) -> bool:
 		"""是否配置了邮箱密码登录"""
 		return bool(self.email and self.password)
+
+	def has_access_token(self) -> bool:
+		"""是否配置了访问令牌（bearer 认证的站点用）"""
+		return bool(self.access_token)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -207,17 +254,18 @@ def load_accounts_config() -> list[AccountConfig] | None:
 
 			if 'api_user' not in account_dict:
 				has_login = account_dict.get('email') and account_dict.get('password')
-				if not has_login:
+				if not has_login and not account_dict.get('access_token'):
 					print(
-						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
+						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password or access_token login can omit it'
 					)
 					return None
 
 			has_cookies = 'cookies' in account_dict and account_dict['cookies']
 			has_login = account_dict.get('email') and account_dict.get('password')
+			has_access_token = bool(account_dict.get('access_token'))
 
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
+			if not has_cookies and not has_login and not has_access_token:
+				print(f'ERROR: Account {i + 1} must have cookies, email+password, or access_token')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:

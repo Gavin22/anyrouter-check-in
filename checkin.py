@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from urllib.parse import quote
 
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
@@ -37,10 +38,12 @@ from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.turnstile import mint_turnstile_token
 
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+ALREADY_CHECKED_KEYWORDS = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
 
 
 def load_balance_hash():
@@ -308,8 +311,7 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 				return True
 			else:
 				error_msg = result.get('msg', result.get('message', 'Unknown error'))
-				already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
-				if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
+				if any(keyword in error_msg.lower() for keyword in ALREADY_CHECKED_KEYWORDS):
 					print(f'[SUCCESS] {account_name}: Already checked in today')
 					return True
 				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
@@ -324,6 +326,172 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 	else:
 		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
 		return False
+
+
+def fetch_site_status(client, domain: str, headers: dict) -> dict:
+	"""读取 /api/status（公开接口），用于拿 Turnstile 开关与 site key。
+
+	必须带浏览器 UA：这两站在 Cloudflare 后面，httpx 默认 UA 会吃 403 HTML。
+	"""
+	public_headers = {k: v for k, v in headers.items() if k.lower() != 'authorization'}
+	try:
+		response = client.get(f'{domain}/api/status', headers=public_headers, timeout=30)
+		if response.status_code == 200:
+			data = response.json()
+			if data.get('success'):
+				return data.get('data') or {}
+		debug_print(f'[INFO] {domain}/api/status returned HTTP {response.status_code}')
+	except Exception as e:  # nosec B110
+		debug_print(f'[INFO] Failed to read {domain}/api/status: {e}')
+	return {}
+
+
+def get_check_in_status(client, headers: dict, status_url: str) -> dict | None:
+	"""查询本月签到状态（NewAPI: GET /api/user/checkin?month=YYYY-MM）。"""
+	try:
+		month = datetime.now().strftime('%Y-%m')
+		response = client.get(f'{status_url}?month={month}', headers=headers, timeout=30)
+		if response.status_code == 200:
+			data = response.json()
+			if data.get('success'):
+				return (data.get('data') or {}).get('stats') or {}
+	except Exception as e:  # nosec B110
+		debug_print(f'[INFO] Failed to read check-in status: {e}')
+	return None
+
+
+def execute_bearer_check_in(
+	client,
+	account_name: str,
+	provider_config,
+	headers: dict,
+	turnstile_token: str | None,
+) -> tuple[bool, bool]:
+	"""POST 签到接口，返回 (是否成功, 是否需要 Turnstile token)。"""
+	print(f'[NETWORK] {account_name}: Executing check-in')
+
+	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+	if turnstile_token:
+		sign_in_url = f'{sign_in_url}?turnstile={quote(turnstile_token, safe="")}'
+
+	checkin_headers = headers.copy()
+	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
+
+	response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
+	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
+
+	try:
+		result = response.json()
+	except json.JSONDecodeError:
+		print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
+		return False, False
+
+	if result.get('success'):
+		awarded = (result.get('data') or {}).get('quota_awarded')
+		if awarded is not None:
+			print(f'[SUCCESS] {account_name}: Check-in successful! Awarded ${round(awarded / 500000, 2)}')
+		else:
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+		return True, False
+
+	error_msg = str(result.get('message') or result.get('msg') or 'Unknown error')
+
+	# 服务端 Turnstile 中间件拒绝时，交由调用方启动浏览器取 token 后重试
+	if 'turnstile' in error_msg.lower():
+		print(f'[INFO] {account_name}: Server requires Turnstile verification - {error_msg}')
+		return False, True
+
+	if any(keyword in error_msg.lower() for keyword in ALREADY_CHECKED_KEYWORDS):
+		print(f'[SUCCESS] {account_name}: Already checked in today')
+		return True, False
+
+	print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
+	return False, False
+
+
+def run_bearer_check_in(
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+	*,
+	turnstile_token: str | None = None,
+) -> tuple[bool, dict | None, dict | None, str | None]:
+	"""bearer 认证站点的签到流程（同步，避免在 async 上下文中使用阻塞 httpx）。
+
+	返回 (是否成功, 签到前信息, 签到后信息, 需要 Turnstile 时的 site key)。
+	第四个值非空表示本次被 Turnstile 拦下，调用方应取 token 后重试。
+	"""
+	try:
+		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
+		proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
+		if proxy_url:
+			client_kwargs['proxy'] = proxy_url
+			if is_debug_enabled():
+				print(f'[INFO] {account_name}: HTTP client proxy enabled: {proxy_url}')
+			else:
+				print(f'[INFO] {account_name}: HTTP client proxy enabled')
+		elif provider_config.use_proxy:
+			print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
+
+		with httpx.Client(**client_kwargs) as client:
+			headers = {
+				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				'Accept': 'application/json, text/plain, */*',
+				'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+				# 不写死 Accept-Encoding：这两站在 Cloudflare 后面，一旦声明 br/zstd
+				# 而运行环境没装对应解码库，httpx 就会拿压缩字节直接解 UTF-8 而报错。
+				# 交给 httpx 按自身可用的解码器协商。
+				'Referer': provider_config.domain,
+				'Origin': provider_config.domain,
+				'Connection': 'keep-alive',
+				'Sec-Fetch-Dest': 'empty',
+				'Sec-Fetch-Mode': 'cors',
+				'Sec-Fetch-Site': 'same-origin',
+				'Authorization': f'Bearer {account.access_token}',
+			}
+
+			# NewAPI rc.21 一类的站点（gorouter）除 Authorization 外仍要求 New-Api-User，
+			# 缺失时会 401 "New-Api-User header not provided"；rc.23（tabitoken）不需要。
+			if account.api_user:
+				headers[provider_config.api_user_key] = account.api_user
+
+			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+			user_info_before = get_user_info(client, headers, user_info_url)
+			if user_info_before and user_info_before.get('success'):
+				print(user_info_before['display'])
+			else:
+				error = user_info_before.get('error', 'Unknown error') if user_info_before else 'Unknown error'
+				print(f'[FAILED] {account_name}: Access token rejected, skipping check-in - {error}')
+				print(f'[HINT] {account_name}: Regenerate the access token on the profile page and update the secret')
+				return False, user_info_before, None, None
+
+			# 先查状态：已签到就直接返回，省掉一次 POST 和整个浏览器流程
+			if provider_config.checkin_status_path:
+				status_url = f'{provider_config.domain}{provider_config.checkin_status_path}'
+				stats = get_check_in_status(client, headers, status_url)
+				if stats and stats.get('checked_in_today'):
+					print(f'[SUCCESS] {account_name}: Already checked in today, nothing to do')
+					return True, user_info_before, user_info_before, None
+
+			success, needs_turnstile = execute_bearer_check_in(
+				client, account_name, provider_config, headers, turnstile_token
+			)
+
+			if needs_turnstile:
+				site_key = provider_config.turnstile_site_key or str(
+					fetch_site_status(client, provider_config.domain, headers).get('turnstile_site_key') or ''
+				)
+				if not site_key:
+					print(f'[FAILED] {account_name}: Turnstile required but site key is unavailable')
+					return False, user_info_before, None, None
+				return False, user_info_before, None, site_key
+
+			user_info_after = get_user_info(client, headers, user_info_url)
+			return success, user_info_before, user_info_after, None
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
+		return False, None, None, None
 
 
 def format_check_in_notification(detail: dict) -> str:
@@ -372,6 +540,33 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
+
+	# bearer 站点（NewAPI v1.0.0-rc）：只认 Authorization 头，且签到接口有 Turnstile
+	if provider_config.uses_bearer_auth():
+		if not account.has_access_token():
+			print(f'[FAILED] {account_name}: Provider "{account.provider}" requires an access_token')
+			return False, None, None
+
+		print(f'[AUTH] {account_name}: Using auth method -> access token')
+		success, user_info_before, user_info_after, site_key = run_bearer_check_in(
+			account, account_name, provider_config
+		)
+
+		if site_key:
+			token = await mint_turnstile_token(
+				provider_config.domain,
+				site_key,
+				account_name=account_name,
+				provider_name=account.provider,
+				use_proxy=provider_config.use_proxy,
+			)
+			if not token:
+				return False, user_info_before, user_info_after
+			success, user_info_before, user_info_after, _ = run_bearer_check_in(
+				account, account_name, provider_config, turnstile_token=token
+			)
+
+		return success, user_info_before, user_info_after
 
 	# 邮箱密码优先
 	all_cookies = None
