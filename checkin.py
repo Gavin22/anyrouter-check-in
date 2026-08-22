@@ -461,8 +461,16 @@ def run_bearer_check_in(
 				print(user_info_before['display'])
 			else:
 				error = user_info_before.get('error', 'Unknown error') if user_info_before else 'Unknown error'
-				print(f'[FAILED] {account_name}: Access token rejected, skipping check-in - {error}')
-				print(f'[HINT] {account_name}: Regenerate the access token on the profile page and update the secret')
+				# 403 是 Cloudflare 拦的，不是令牌问题：机房出口 IP 信誉差时会直接
+				# 返回挑战页。别把它误报成令牌失效，否则会被引去重新生成令牌。
+				if 'HTTP 403' in error:
+					print(f'[FAILED] {account_name}: Blocked by Cloudflare before auth - {error}')
+					print(f'[HINT] {account_name}: Egress IP is being challenged; enable use_proxy for this provider')
+				else:
+					print(f'[FAILED] {account_name}: Access token rejected, skipping check-in - {error}')
+					print(
+						f'[HINT] {account_name}: Regenerate the access token on the profile page and update the secret'
+					)
 				return False, user_info_before, None, None
 
 			# 先查状态：已签到就直接返回，省掉一次 POST 和整个浏览器流程
