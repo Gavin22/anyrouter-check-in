@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from urllib.parse import quote
@@ -407,6 +408,42 @@ def execute_bearer_check_in(
 	return False, False
 
 
+def classify_user_info_failure(error: str) -> tuple[str, str, str] | None:
+	"""区分「不是访问令牌的问题」的几类失败，返回 (日志原因, 日志提示, 通知文案)。
+
+	返回 None 表示确实该怀疑令牌。误报成令牌失效的代价是被引去重新生成令牌、
+	换 secret，而真正的原因根本不在我们这边。
+	"""
+	match = re.search(r'HTTP (\d{3})', error)
+	if match is None:
+		# 连不上、超时、TLS 失败：压根没拿到 HTTP 响应，谈不上认证
+		return (
+			'Cannot reach the site, not a token problem',
+			'Network failure on the way out; it should recover on its own',
+			'无法连接站点，非令牌问题',
+		)
+
+	status = int(match.group(1))
+
+	# Cloudflare 拦机房出口 IP 时直接返回挑战页，不是令牌失效
+	if status == 403:
+		return (
+			'Blocked by Cloudflare before auth',
+			'Egress IP is being challenged; enable use_proxy for this provider',
+			'被 Cloudflare 拦截（HTTP 403），非令牌问题',
+		)
+
+	# 5xx 是站点自己挂了（522 源站连不上、502/503 后端不可用），我们这边没什么可修的
+	if 500 <= status <= 599:
+		return (
+			f'Site is down (HTTP {status}), not a token problem',
+			'The site itself is returning 5xx; it should recover on its own',
+			f'站点暂时故障（HTTP {status}），非令牌问题',
+		)
+
+	return None
+
+
 def run_bearer_check_in(
 	account: AccountConfig,
 	account_name: str,
@@ -459,11 +496,14 @@ def run_bearer_check_in(
 				print(user_info_before['display'])
 			else:
 				error = user_info_before.get('error', 'Unknown error') if user_info_before else 'Unknown error'
-				# 403 是 Cloudflare 拦的，不是令牌问题：机房出口 IP 信誉差时会直接
-				# 返回挑战页。别把它误报成令牌失效，否则会被引去重新生成令牌。
-				if 'HTTP 403' in error:
-					print(f'[FAILED] {account_name}: Blocked by Cloudflare before auth - {error}')
-					print(f'[HINT] {account_name}: Egress IP is being challenged; enable use_proxy for this provider')
+				classified = classify_user_info_failure(error)
+				if classified:
+					reason, hint, notice = classified
+					print(f'[FAILED] {account_name}: {reason} - {error}')
+					print(f'[HINT] {account_name}: {hint}')
+					# 通知里也别写 raw 英文报错，否则看着像令牌坏了
+					if user_info_before is not None:
+						user_info_before['error'] = notice
 				else:
 					print(f'[FAILED] {account_name}: Access token rejected, skipping check-in - {error}')
 					print(
