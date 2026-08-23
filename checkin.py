@@ -9,7 +9,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -542,6 +542,24 @@ def run_bearer_check_in(
 
 SEPARATOR = '━━━━━━━━━━━━━━━━━━━━'
 
+# 北京不施行夏令时，固定 UTC+8 就够，不用依赖系统 tzdata（GitHub runner 上不一定有）
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def beijing_now_text() -> str:
+	"""通知和日志里的时间统一用北京时间：runner 是 UTC，直接 now() 会比国内时间早 8 小时。"""
+	return datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def add_list_index(block: str, index: int) -> str:
+	"""给通知块的标题行加上列表序号。
+
+	成功 / 失败 / 异常三种块都是「分隔线 + 图标账号名 + 明细」的结构，
+	所以插到第二行行首即可。序号按通知里实际展示的顺序编，不留空号。
+	"""
+	separator, _, rest = block.partition('\n')
+	return f'{separator}\n{index}. {rest}'
+
 
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化单个账号的签到结果"""
@@ -754,7 +772,7 @@ async def main():
 		print('[INFO] Debug mode disabled (set DEBUG_MODE=true to enable screenshots and verbose logs)')
 
 	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started')
-	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+	print(f'[TIME] Execution time: {beijing_now_text()} (Asia/Shanghai)')
 
 	app_config = AppConfig.load_from_env()
 	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
@@ -869,9 +887,10 @@ async def main():
 			if detail:
 				account_blocks[account_key] = format_check_in_notification(detail)
 
-	notification_content = [
+	ordered_blocks = [
 		account_blocks[f'account_{i + 1}'] for i in range(total_count) if f'account_{i + 1}' in account_blocks
 	]
+	notification_content = [add_list_index(block, position) for position, block in enumerate(ordered_blocks, start=1)]
 
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
@@ -889,7 +908,7 @@ async def main():
 		else:
 			summary.append('   🚨 全部账号签到失败')
 
-		header = f'🎯 每日签到结果\n🕐 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+		header = f'🎯 每日签到结果\n🕐 {beijing_now_text()}（北京时间）'
 
 		notify_content = '\n\n'.join([header, '\n\n'.join(notification_content), '\n'.join(summary)])
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
