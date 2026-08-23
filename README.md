@@ -7,7 +7,7 @@
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![License](https://img.shields.io/github/license/millylee/anyrouter-check-in)](LICENSE)
 
-多平台多账号自动签到，理论上支持所有 NewAPI、OneAPI 平台，目前内置支持 Any Router、Agent Router、GoRouter、TaBiAI，其它可根据文档进行摸索配置。
+多平台多账号自动签到，理论上支持所有 NewAPI、OneAPI 平台，目前内置支持 Any Router、Agent Router、GoRouter、TaBiAI、JustDoWork，其它可根据文档进行摸索配置。
 
 推荐搭配使用[Auo](https://github.com/millylee/auo)，支持任意 Claude Code Token 切换的工具。
 
@@ -83,7 +83,7 @@
 
 - `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
 - `cookies`：兼容旧版的 session cookies 登录方式
-- `access_token`：访问令牌登录，用于 `auth_scheme` 为 `bearer` 的站点（如 `gorouter`、`tabitoken`），详见[访问令牌签到](#访问令牌签到gorouter--tabiai-等-newapi-新版站点)
+- `access_token`：访问令牌登录，用于 `auth_scheme` 为 `bearer` 的站点（如 `gorouter`、`tabitoken`、`justdowork`），详见[访问令牌签到](#访问令牌签到gorouter--tabiai-等-newapi-新版站点)
 - `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略，`gorouter` 用访问令牌时必填
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
@@ -92,7 +92,7 @@
 
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
-- `anyrouter`、`agentrouter`、`gorouter`、`tabitoken` 配置已内置，无需填写
+- `anyrouter`、`agentrouter`、`gorouter`、`tabitoken`、`justdowork` 配置已内置，无需填写
 
 如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。
 
@@ -264,17 +264,17 @@
 
 ## 访问令牌签到（GoRouter / TaBiAI 等 NewAPI 新版站点）
 
-`gorouter`、`tabitoken` 已内置配置，无需在 `PROVIDERS` 中声明，只要在 `ANYROUTER_ACCOUNTS` 里配好账号即可。
+`gorouter`、`tabitoken`、`justdowork` 已内置配置，无需在 `PROVIDERS` 中声明，只要在 `ANYROUTER_ACCOUNTS` 里配好账号即可。
 
-### 为什么这两站不能用 session cookie
+### 为什么这几站不能用 session cookie
 
 它们是 NewAPI `v1.0.0-rc` 系列：
 
 - 签到接口从 `/api/user/sign_in` 换成了 `/api/user/checkin`
 - 签到接口挂了 `middleware.TurnstileCheck()`，服务端从 query 参数 `turnstile` 取 token 去 Cloudflare 校验，**纯 HTTP 请求签不了**
-- 只能通过 GitHub 授权登录，且 `rc.23`（tabitoken）已完全移除 cookie 会话，只认 `Authorization` 头
+- 只能通过 GitHub 授权登录，且 `rc.23`（tabitoken、justdowork）已完全移除 cookie 会话，只认 `Authorization` 头
 
-所以这两站用**访问令牌**认证：令牌长期有效，不像 session cookie 那样每月过期，反而比 AnyRouter 更省心。
+所以这几站用**访问令牌**认证：令牌长期有效，不像 session cookie 那样每月过期，反而比 AnyRouter 更省心。
 
 ### 获取访问令牌
 
@@ -315,6 +315,10 @@ fetch('/api/user/auth/refresh', { method: 'POST' })
 
 多这一步 refresh 是因为 rc.23 已经彻底移除 cookie 会话：浏览器里存的是 `new_api_refresh` cookie（限定 path `/api/user/auth`），要先用它换一个 15 分钟有效的 access token，才能调 `/api/user/token`。所以直接 `fetch('/api/user/token')` 会返回 `access token 无效`。
 
+#### api.justwoker.icu（JustDoWork）
+
+和 tabitoken 同一套（`/api/user/auth/refresh` 存在、`GET /api/user/token` 只认 Bearer），控制台命令与上面 tabitoken 那段完全一致，把域名换成 https://api.justwoker.icu 即可。同样只需要令牌，`api_user` 可省略。
+
 #### 验证令牌可用
 
 拿到令牌后可以先自测（把 `<域名>` 和 `<令牌>` 换掉；gorouter 记得补 `-H "New-Api-User: <用户ID>"`）：
@@ -332,7 +336,8 @@ curl -s "https://<域名>/api/user/self" \
 ```json
 [
   { "name": "GoRouter", "provider": "gorouter", "access_token": "你的访问令牌", "api_user": "你的用户 ID" },
-  { "name": "TaBiAI", "provider": "tabitoken", "access_token": "你的访问令牌" }
+  { "name": "TaBiAI", "provider": "tabitoken", "access_token": "你的访问令牌" },
+  { "name": "JustDoWork", "provider": "justdowork", "access_token": "你的访问令牌" }
 ]
 ```
 
@@ -346,8 +351,8 @@ curl -s "https://<域名>/api/user/self" \
 ```
 
 - `gorouter`（rc.21）除 `Authorization` 外**仍要求 `New-Api-User` 请求头**，缺失会返回 `401 New-Api-User header not provided`，所以必须配 `api_user`
-- `tabitoken`（rc.23）不需要该头，`api_user` 可省略
-- 建议把这两个账号放在数组**末尾**，让 AnyRouter 的持久化 profile 先跑，避免浏览器启动参数互相影响（见文末问题记录）
+- `tabitoken`、`justdowork`（rc.23）不需要该头，`api_user` 可省略
+- 建议把这些账号放在数组**末尾**，让 AnyRouter 的持久化 profile 先跑，避免浏览器启动参数互相影响（见文末问题记录）
 
 ### 签到流程
 
@@ -364,8 +369,8 @@ curl -s "https://<域名>/api/user/self" \
 - 组件渲染的是 managed 交互式挑战（「请验证您是真人」复选框），**不会自动过**，必须点复选框；点组件正中间无效，复选框在左侧约 20px 处
 - 组件 iframe 在 closed shadow root 里，Playwright 的 CSS 选择器穿不进去（`#holder iframe` 匹配不到），只能按坐标点
 - token 单次有效、约 300 秒过期，且**必须与后续签到请求同出口 IP**
-- 机房 IP 更容易被判交互式挑战。若 Actions 上取不到 token，给这两个 provider 打开代理即可，不需要改代码：
-  `PROVIDERS={"gorouter":{"domain":"https://gorouter.app","use_proxy":true},"tabitoken":{"domain":"https://tabitoken.com","use_proxy":true}}`
+- 机房 IP 更容易被判交互式挑战。若 Actions 上取不到 token，给这些 provider 打开代理即可，不需要改代码：
+  `PROVIDERS={"gorouter":{"domain":"https://gorouter.app","use_proxy":true},"tabitoken":{"domain":"https://tabitoken.com","use_proxy":true},"justdowork":{"domain":"https://api.justwoker.icu","use_proxy":true}}`
 
 **内置配置说明**：
 
@@ -376,6 +381,9 @@ curl -s "https://<域名>/api/user/self" \
   - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
   - `sign_in_path: null`（查询用户信息时自动签到）
   - `use_proxy: true`
+- `gorouter`、`tabitoken`、`justdowork`：
+  - `auth_scheme: "bearer"`，`sign_in_path`/`checkin_status_path` 均为 `/api/user/checkin`
+  - `turnstile_site_key` 留空，运行时从 `/api/status` 读，站点轮换 key 也不用改配置
 
 **重要提示**：
 
@@ -463,11 +471,14 @@ PROVIDERS={"agentrouter":{"use_proxy":true}}
 4. 网站是否更改了签到接口
 5. 查看 Actions 运行日志获取详细错误信息
 
-访问令牌站点（`gorouter` / `tabitoken`）的常见报错：
+访问令牌站点（`gorouter` / `tabitoken` / `justdowork`）的常见报错：
 
 | 日志 | 原因与处理 |
 | --- | --- |
 | `Access token rejected, skipping check-in` | 令牌失效或被重新生成过，去个人资料页重新生成并更新 secret |
+| `Site is down (HTTP 5xx), not a token problem` | 站点自己挂了，等它恢复，不用动令牌 |
+| `Cannot reach the site, not a token problem` | 出网失败（DNS/TLS/超时），和认证无关 |
+| `Blocked by Cloudflare before auth` | 出口 IP 被 Cloudflare 拦，给该 provider 打开 `use_proxy` |
 | `401 New-Api-User header not provided` | `gorouter` 账号漏配 `api_user`，补上你的用户 ID |
 | `Turnstile required but site key is unavailable` | `/api/status` 没读到 site key。该接口必须带浏览器 UA，否则会被 Cloudflare 403 |
 | `Could not obtain Turnstile token` | 出口 IP 被判交互式挑战且没过。开 `DEBUG_MODE=true` 看 `turnstile-*` 截图，再考虑给该 provider 打开 `use_proxy` |
