@@ -47,7 +47,8 @@ class FakeClient:
 		self.calls.append((method, url, dict(headers or {})))
 		for key, payload in self.routes.items():
 			if key in f'{method} {url}':
-				return FakeResponse(payload)
+				# 路由值可以直接给 FakeResponse，用来模拟非 200 的状态码
+				return payload if isinstance(payload, FakeResponse) else FakeResponse(payload)
 		raise AssertionError(f'unrouted request: {method} {url}')
 
 	def get(self, url, headers=None, **kwargs):
@@ -71,6 +72,10 @@ def gorouter_account():
 
 def tabitoken_account():
 	return AccountConfig(cookies=None, provider='tabitoken', name='TaBiAI', access_token='tok-xyz')
+
+
+def justdowork_account():
+	return AccountConfig(cookies=None, provider='justdowork', name='JustDoWork', access_token='tok-jdw')
 
 
 def test_rejected_access_token_aborts_before_check_in(monkeypatch):
@@ -188,3 +193,54 @@ def test_no_hardcoded_accept_encoding(monkeypatch):
 
 	headers = client.calls[0][2]
 	assert not any(k.lower() == 'accept-encoding' for k in headers)
+
+
+def test_justdowork_uses_the_same_bearer_flow(monkeypatch):
+	"""JustDoWork（api.justwoker.icu）的面板接口与 tabitoken 同形：Bearer 认证、/api/user/checkin、免 New-Api-User。"""
+	routes = {
+		'GET https://api.justwoker.icu/api/user/self': SELF_OK,
+		'GET https://api.justwoker.icu/api/user/checkin?month=': STATS_DONE,
+	}
+
+	(success, before, after, site_key), client = run(
+		monkeypatch, routes, justdowork_account(), provider_name='justdowork'
+	)
+
+	assert success is True
+	assert site_key is None
+	assert before and after
+	# 已签到就不该再 POST，省掉整个浏览器取 Turnstile 的流程
+	assert not [c for c in client.calls if c[0] == 'POST']
+	headers = client.calls[0][2]
+	assert headers['Authorization'] == 'Bearer tok-jdw'
+	assert not any(k.lower() == 'new-api-user' for k in headers)
+
+
+def test_site_outage_is_not_blamed_on_the_access_token(monkeypatch):
+	"""站点 5xx（GoRouter 曾整天 522）不能报成令牌失效，否则会被引去白换令牌。"""
+	routes = {'GET https://gorouter.app/api/user/self': FakeResponse({}, status=522)}
+
+	(success, before, after, site_key), client = run(monkeypatch, routes, gorouter_account())
+
+	assert success is False
+	assert site_key is None
+	assert not [c for c in client.calls if c[0] == 'POST']
+	# 通知里给的是「站点故障」，不是 raw 英文报错
+	assert before is not None
+	assert before['error'] == '站点暂时故障（HTTP 522），非令牌问题'
+
+
+def test_classify_user_info_failure_separates_site_problems_from_token_problems():
+	cloudflare = checkin.classify_user_info_failure('Failed to get user info: HTTP 403')
+	assert cloudflare is not None and 'Cloudflare' in cloudflare[0]
+
+	outage = checkin.classify_user_info_failure('Failed to get user info: HTTP 502')
+	assert outage is not None and 'HTTP 502' in outage[2]
+
+	# 连不上时压根没有 HTTP 状态码，同样不是令牌的问题
+	unreachable = checkin.classify_user_info_failure('Failed to get user info: All connection attempts fail...')
+	assert unreachable is not None and '无法连接' in unreachable[2]
+
+	# 这两种才该怀疑令牌：明确的 401，以及 200 但 success=false
+	assert checkin.classify_user_info_failure('Failed to get user info: HTTP 401') is None
+	assert checkin.classify_user_info_failure('Failed to get user info: HTTP 200') is None

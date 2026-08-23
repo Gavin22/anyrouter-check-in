@@ -120,7 +120,7 @@ class AppConfig:
 				use_proxy=True,
 				persist_profile=False,
 			),
-			# 以下两站为 NewAPI v1.0.0-rc：签到接口是 /api/user/checkin，且只认
+			# 以下三站为 NewAPI v1.0.0-rc：签到接口是 /api/user/checkin，且只认
 			# Authorization 头（上游已移除 cookie 会话），故 auth_scheme='bearer'。
 			# turnstile_site_key 留空表示运行时从 /api/status 读取，站点轮换 key 也不会失效。
 			'gorouter': ProviderConfig(
@@ -138,6 +138,18 @@ class AppConfig:
 			'tabitoken': ProviderConfig(
 				name='tabitoken',
 				domain='https://tabitoken.com',
+				login_path='/login',
+				sign_in_path='/api/user/checkin',
+				user_info_path='/api/user/self',
+				checkin_status_path='/api/user/checkin',
+				auth_scheme='bearer',
+				bypass_method=None,
+				use_proxy=False,
+				persist_profile=False,
+			),
+			'justdowork': ProviderConfig(
+				name='justdowork',
+				domain='https://api.justwoker.icu',
 				login_path='/login',
 				sign_in_path='/api/user/checkin',
 				user_info_path='/api/user/self',
