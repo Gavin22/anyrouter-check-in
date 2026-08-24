@@ -159,6 +159,23 @@ class AppConfig:
 				use_proxy=False,
 				persist_profile=False,
 			),
+			# WONG 公益站同为 /api/user/checkin，但 /api/status 里 turnstile_check=false，
+			# 纯访问令牌即可签到；它要 New-Api-User 头（同 gorouter），账号里得配 api_user。
+			# checkin_status_path 留空：该站的状态查询把 checked_in 平铺在 data 里而不是
+			# data.stats，get_check_in_status 读不到，白发一次请求；重复 POST 会回
+			# 「今天已经签到过啦」，命中 ALREADY_CHECKED_KEYWORDS，一样报成功。
+			'wong': ProviderConfig(
+				name='wong',
+				domain='https://wzw.pp.ua',
+				login_path='/login',
+				sign_in_path='/api/user/checkin',
+				user_info_path='/api/user/self',
+				checkin_status_path=None,
+				auth_scheme='bearer',
+				bypass_method=None,
+				use_proxy=False,
+				persist_profile=False,
+			),
 		}
 
 		# 尝试从环境变量加载自定义 providers

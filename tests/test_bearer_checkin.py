@@ -78,6 +78,10 @@ def justdowork_account():
 	return AccountConfig(cookies=None, provider='justdowork', name='JustDoWork', access_token='tok-jdw')
 
 
+def wong_account():
+	return AccountConfig(cookies=None, provider='wong', name='WONG', access_token='tok-wong', api_user='8039')
+
+
 def test_rejected_access_token_aborts_before_check_in(monkeypatch):
 	routes = {'GET https://gorouter.app/api/user/self': SELF_BAD}
 
@@ -214,6 +218,41 @@ def test_justdowork_uses_the_same_bearer_flow(monkeypatch):
 	headers = client.calls[0][2]
 	assert headers['Authorization'] == 'Bearer tok-jdw'
 	assert not any(k.lower() == 'new-api-user' for k in headers)
+
+
+def test_wong_checks_in_without_a_status_precheck(monkeypatch):
+	"""WONG 公益站免 Turnstile，但状态查询不带 stats，所以直接 POST，且要 New-Api-User 头。"""
+	routes = {
+		'GET https://wzw.pp.ua/api/user/self': SELF_OK,
+		'POST https://wzw.pp.ua/api/user/checkin': {
+			'success': True,
+			'data': {'checked_in': True, 'quota': 13_415_360},
+		},
+	}
+
+	(success, before, after, site_key), client = run(monkeypatch, routes, wong_account(), provider_name='wong')
+
+	assert success is True
+	assert site_key is None
+	assert before and after
+	# checkin_status_path 为空，不该白发一次状态查询
+	assert not [c for c in client.calls if 'month=' in c[1]]
+	headers = client.calls[0][2]
+	assert headers['Authorization'] == 'Bearer tok-wong'
+	assert headers['new-api-user'] == '8039'
+
+
+def test_wong_duplicate_check_in_counts_as_success(monkeypatch):
+	"""没有状态预检，重复签到全靠这句服务端文案兜底。"""
+	routes = {
+		'GET https://wzw.pp.ua/api/user/self': SELF_OK,
+		'POST https://wzw.pp.ua/api/user/checkin': {'success': False, 'message': '今天已经签到过啦'},
+	}
+
+	(success, _, _, site_key), _ = run(monkeypatch, routes, wong_account(), provider_name='wong')
+
+	assert success is True
+	assert site_key is None
 
 
 def test_site_outage_is_not_blamed_on_the_access_token(monkeypatch):
