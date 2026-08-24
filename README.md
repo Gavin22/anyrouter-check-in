@@ -83,8 +83,8 @@
 
 - `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
 - `cookies`：兼容旧版的 session cookies 登录方式
-- `access_token`：访问令牌登录，用于 `auth_scheme` 为 `bearer` 的站点（如 `gorouter`、`tabitoken`、`justdowork`），详见[访问令牌签到](#访问令牌签到gorouter--tabiai-等-newapi-新版站点)
-- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略，`gorouter` 用访问令牌时必填
+- `access_token`：访问令牌登录，用于 `auth_scheme` 为 `bearer` 的站点（如 `gorouter`、`tabitoken`、`justdowork`、`wong`），详见[访问令牌签到](#访问令牌签到gorouter--tabiai-等-newapi-新版站点)
+- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略，`gorouter`、`wong` 用访问令牌时必填
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -92,7 +92,7 @@
 
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
-- `anyrouter`、`agentrouter`、`gorouter`、`tabitoken`、`justdowork` 配置已内置，无需填写
+- `anyrouter`、`agentrouter`、`gorouter`、`tabitoken`、`justdowork`、`wong` 配置已内置，无需填写
 
 如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。
 
@@ -264,7 +264,7 @@
 
 ## 访问令牌签到（GoRouter / TaBiAI 等 NewAPI 新版站点）
 
-`gorouter`、`tabitoken`、`justdowork` 已内置配置，无需在 `PROVIDERS` 中声明，只要在 `ANYROUTER_ACCOUNTS` 里配好账号即可。
+`gorouter`、`tabitoken`、`justdowork`、`wong` 已内置配置，无需在 `PROVIDERS` 中声明，只要在 `ANYROUTER_ACCOUNTS` 里配好账号即可。
 
 ### 为什么这几站不能用 session cookie
 
@@ -273,6 +273,7 @@
 - 签到接口从 `/api/user/sign_in` 换成了 `/api/user/checkin`
 - 签到接口挂了 `middleware.TurnstileCheck()`，服务端从 query 参数 `turnstile` 取 token 去 Cloudflare 校验，**纯 HTTP 请求签不了**
 - 只能通过 GitHub 授权登录，且 `rc.23`（tabitoken、justdowork）已完全移除 cookie 会话，只认 `Authorization` 头
+- `wong`（WONG 公益站，linuxdo 授权登录）签到接口同为 `/api/user/checkin`，但 `/api/status` 里 `turnstile_check=false`，**纯访问令牌就能签，不启动浏览器**
 
 所以这几站用**访问令牌**认证：令牌长期有效，不像 session cookie 那样每月过期，反而比 AnyRouter 更省心。
 
@@ -337,7 +338,8 @@ curl -s "https://<域名>/api/user/self" \
 [
   { "name": "GoRouter", "provider": "gorouter", "access_token": "你的访问令牌", "api_user": "你的用户 ID" },
   { "name": "TaBiAI", "provider": "tabitoken", "access_token": "你的访问令牌" },
-  { "name": "JustDoWork", "provider": "justdowork", "access_token": "你的访问令牌" }
+  { "name": "JustDoWork", "provider": "justdowork", "access_token": "你的访问令牌" },
+  { "name": "WONG公益站", "provider": "wong", "access_token": "你的访问令牌", "api_user": "你的用户 ID" }
 ]
 ```
 
@@ -350,14 +352,14 @@ curl -s "https://<域名>/api/user/self" \
 ]
 ```
 
-- `gorouter`（rc.21）除 `Authorization` 外**仍要求 `New-Api-User` 请求头**，缺失会返回 `401 New-Api-User header not provided`，所以必须配 `api_user`
+- `gorouter`（rc.21）、`wong` 除 `Authorization` 外**仍要求 `New-Api-User` 请求头**，缺失会返回 `401 New-Api-User header not provided`，所以必须配 `api_user`
 - `tabitoken`、`justdowork`（rc.23）不需要该头，`api_user` 可省略
 - 建议把这些账号放在数组**末尾**，让 AnyRouter 的持久化 profile 先跑，避免浏览器启动参数互相影响（见文末问题记录）
 
 ### 签到流程
 
 1. `GET /api/user/self` 取签到前余额；令牌失效则直接跳过该账号并提示重新生成
-2. `GET /api/user/checkin?month=YYYY-MM` 查当天状态，**已签到就直接结束**（不发请求、不启动浏览器）
+2. `GET /api/user/checkin?month=YYYY-MM` 查当天状态，**已签到就直接结束**（不发请求、不启动浏览器）；`wong` 的状态查询把 `checked_in` 平铺在 `data` 里而不是 `data.stats`，读不到就跳过这步，直接进第 3 步，重复签到由服务端的「今天已经签到过啦」兜底
 3. `POST /api/user/checkin`；被 Turnstile 拦下时启动 CloakBrowser 取 token，带 `?turnstile=<token>` 重发
 4. `GET /api/user/self` 取签到后余额，进入统一的通知汇总
 
@@ -370,7 +372,7 @@ curl -s "https://<域名>/api/user/self" \
 - 组件 iframe 在 closed shadow root 里，Playwright 的 CSS 选择器穿不进去（`#holder iframe` 匹配不到），只能按坐标点
 - token 单次有效、约 300 秒过期，且**必须与后续签到请求同出口 IP**
 - 机房 IP 更容易被判交互式挑战。若 Actions 上取不到 token，给这些 provider 打开代理即可，不需要改代码：
-  `PROVIDERS={"gorouter":{"domain":"https://gorouter.app","use_proxy":true},"tabitoken":{"domain":"https://tabitoken.com","use_proxy":true},"justdowork":{"domain":"https://api.justwoker.icu","use_proxy":true}}`
+  `PROVIDERS={"gorouter":{"domain":"https://gorouter.app","use_proxy":true},"tabitoken":{"domain":"https://tabitoken.com","use_proxy":true},"justdowork":{"domain":"https://api.justwoker.icu","use_proxy":true},"wong":{"domain":"https://wzw.pp.ua","use_proxy":true}}`
 
 **内置配置说明**：
 
@@ -384,6 +386,9 @@ curl -s "https://<域名>/api/user/self" \
 - `gorouter`、`tabitoken`、`justdowork`：
   - `auth_scheme: "bearer"`，`sign_in_path`/`checkin_status_path` 均为 `/api/user/checkin`
   - `turnstile_site_key` 留空，运行时从 `/api/status` 读，站点轮换 key 也不用改配置
+- `wong`：
+  - `auth_scheme: "bearer"`，`sign_in_path: "/api/user/checkin"`，`checkin_status_path: null`（该站状态查询不带 `stats`）
+  - 站点未开 Turnstile，签到全程只需访问令牌 + `New-Api-User`
 
 **重要提示**：
 
@@ -471,7 +476,7 @@ PROVIDERS={"agentrouter":{"use_proxy":true}}
 4. 网站是否更改了签到接口
 5. 查看 Actions 运行日志获取详细错误信息
 
-访问令牌站点（`gorouter` / `tabitoken` / `justdowork`）的常见报错：
+访问令牌站点（`gorouter` / `tabitoken` / `justdowork` / `wong`）的常见报错：
 
 | 日志 | 原因与处理 |
 | --- | --- |
@@ -479,7 +484,7 @@ PROVIDERS={"agentrouter":{"use_proxy":true}}
 | `Site is down (HTTP 5xx), not a token problem` | 站点自己挂了，等它恢复，不用动令牌 |
 | `Cannot reach the site, not a token problem` | 出网失败（DNS/TLS/超时），和认证无关 |
 | `Blocked by Cloudflare before auth` | 出口 IP 被 Cloudflare 拦，给该 provider 打开 `use_proxy` |
-| `401 New-Api-User header not provided` | `gorouter` 账号漏配 `api_user`，补上你的用户 ID |
+| `401 New-Api-User header not provided` | `gorouter` / `wong` 账号漏配 `api_user`，补上你的用户 ID |
 | `Turnstile required but site key is unavailable` | `/api/status` 没读到 site key。该接口必须带浏览器 UA，否则会被 Cloudflare 403 |
 | `Could not obtain Turnstile token` | 出口 IP 被判交互式挑战且没过。开 `DEBUG_MODE=true` 看 `turnstile-*` 截图，再考虑给该 provider 打开 `use_proxy` |
 | `Turnstile 校验失败，请刷新重试` | token 已被用过、超过 300 秒，或取 token 与发签到走了不同出口 IP |
