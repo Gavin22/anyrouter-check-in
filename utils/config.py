@@ -176,6 +176,24 @@ class AppConfig:
 				use_proxy=False,
 				persist_profile=False,
 			),
+			# HappyCoding 公益站：NewAPI v1.0.0-rc.40，linuxdo 授权登录。
+			# /api/status 里 checkin_enabled=true 且 turnstile_check=false，
+			# 纯访问令牌即可签到，不需要 Turnstile。
+			# 已签到时 POST /api/user/checkin 回「今日已签到」（success=false），
+			# 比 wong 的「今天已经签到过啦」更短，不命中 ALREADY_CHECKED_KEYWORDS，
+			# 所以必须配 checkin_status_path 让已签到的账号走状态查询提前返回。
+			'happycoding': ProviderConfig(
+				name='happycoding',
+				domain='https://happycoding.xyz',
+				login_path='/login',
+				sign_in_path='/api/user/checkin',
+				user_info_path='/api/user/self',
+				checkin_status_path='/api/user/checkin',
+				auth_scheme='bearer',
+				bypass_method=None,
+				use_proxy=False,
+				persist_profile=False,
+			),
 		}
 
 		# 尝试从环境变量加载自定义 providers

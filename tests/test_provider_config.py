@@ -66,7 +66,11 @@ def test_builtin_bearer_providers(monkeypatch):
 
 	config = AppConfig.load_from_env()
 
-	expected_domains = {'gorouter': 'https://gorouter.app', 'tabitoken': 'https://tabitoken.com'}
+	expected_domains = {
+		'gorouter': 'https://gorouter.app',
+		'tabitoken': 'https://tabitoken.com',
+		'happycoding': 'https://happycoding.xyz',
+	}
 	for name, domain in expected_domains.items():
 		provider = config.providers[name]
 		assert provider.domain == domain
